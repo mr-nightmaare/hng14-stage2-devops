@@ -1,0 +1,240 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─────────────────────────── Stage 1: Lint ───────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python linting with flake8
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Lint API (flake8)
+        run: flake8 api/ --max-line-length=120 --exclude=api/tests/__init__.py
+
+      - name: Lint Worker (flake8)
+        run: flake8 worker/ --max-line-length=120
+
+      # JavaScript linting with eslint
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install ESLint
+        working-directory: frontend
+        run: npm install eslint@8 --save-dev
+
+      - name: Lint Frontend (eslint)
+        working-directory: frontend
+        run: npx eslint app.js --no-eslintrc --env node --env es2021 --parser-options=ecmaVersion:2021
+
+      # Dockerfile linting with hadolint
+      - name: Lint Dockerfiles (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+
+      - name: Lint Worker Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+
+      - name: Lint Frontend Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+
+  # ─────────────────────────── Stage 2: Test ───────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: api
+        run: pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        working-directory: api
+        run: |
+          pytest tests/ -v \
+            --cov=main \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov \
+            --cov-report=term
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            api/coverage.xml
+            api/htmlcov/
+
+  # ─────────────────────────── Stage 3: Build ──────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image
+        run: |
+          docker build -t localhost:5000/api:${{ github.sha }} -t localhost:5000/api:latest ./api
+
+      - name: Build Worker image
+        run: |
+          docker build -t localhost:5000/worker:${{ github.sha }} -t localhost:5000/worker:latest ./worker
+
+      - name: Build Frontend image
+        run: |
+          docker build -t localhost:5000/frontend:${{ github.sha }} -t localhost:5000/frontend:latest ./frontend
+
+      - name: Push images to local registry
+        run: |
+          docker push localhost:5000/api:${{ github.sha }}
+          docker push localhost:5000/api:latest
+          docker push localhost:5000/worker:${{ github.sha }}
+          docker push localhost:5000/worker:latest
+          docker push localhost:5000/frontend:${{ github.sha }}
+          docker push localhost:5000/frontend:latest
+
+  # ──────────────────────── Stage 4: Security Scan ─────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images for scanning
+        run: |
+          docker build -t api:scan ./api
+          docker build -t worker:scan ./worker
+          docker build -t frontend:scan ./frontend
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Scan API image
+        run: |
+          trivy image --severity CRITICAL --exit-code 1 \
+            --format sarif --output api-trivy.sarif \
+            api:scan || true
+          trivy image --severity CRITICAL --exit-code 1 api:scan
+
+      - name: Scan Worker image
+        run: |
+          trivy image --severity CRITICAL --exit-code 1 \
+            --format sarif --output worker-trivy.sarif \
+            worker:scan || true
+          trivy image --severity CRITICAL --exit-code 1 worker:scan
+
+      - name: Scan Frontend image
+        run: |
+          trivy image --severity CRITICAL --exit-code 1 \
+            --format sarif --output frontend-trivy.sarif \
+            frontend:scan || true
+          trivy image --severity CRITICAL --exit-code 1 frontend:scan
+
+      - name: Upload Trivy SARIF results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif-results
+          path: |
+            api-trivy.sarif
+            worker-trivy.sarif
+            frontend-trivy.sarif
+
+  # ──────────────────── Stage 5: Integration Test ──────────────────────
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env for integration test
+        run: |
+          echo "REDIS_PASSWORD=testpassword123" > .env
+          echo "FRONTEND_PORT=3000" >> .env
+
+      - name: Build and start stack
+        run: docker compose up -d --build
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for services to become healthy..."
+          timeout 120 bash -c '
+            until docker compose ps | grep -v "unhealthy" | grep -q "healthy"; do
+              echo "Waiting..."
+              sleep 5
+            done
+          '
+          docker compose ps
+
+      - name: Run integration test
+        run: |
+          chmod +x scripts/integration-test.sh
+          ./scripts/integration-test.sh
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v
+
+  # ────────────────────────── Stage 6: Deploy ──────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env for deployment
+        run: |
+          echo "REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}" > .env
+          echo "FRONTEND_PORT=3000" >> .env
+
+      - name: Run rolling deploy
+        run: |
+          chmod +x scripts/deploy.sh
+          ./scripts/deploy.sh
